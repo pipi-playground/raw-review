@@ -368,6 +368,16 @@ def test_hard_exact_ok():
     c = AttributeConstraint(name="대상기기", hard=True, match_mode=MatchMode.EXACT,
                             wanted=["아이폰17"], exclusions=["17 Pro"])
     assert c.wanted == ["아이폰17"]
+
+def test_numeric_wanted_must_be_numeric():
+    with pytest.raises(ValueError):
+        AttributeConstraint(name="사이즈", hard=True, match_mode=MatchMode.NUMERIC,
+                            wanted=["라지"], unit="mm")
+
+def test_range_requires_valid_bounds():
+    with pytest.raises(ValueError):
+        AttributeConstraint(name="사이즈", hard=True, match_mode=MatchMode.RANGE,
+                            range=(260.0, 240.0), unit="mm")
 ```
 
 - [ ] **Step 2: 실패 확인** — Run: `cd apps/api && pytest tests/shared/test_search_spec.py -v` → FAIL
@@ -429,10 +439,20 @@ class AttributeConstraint(BaseModel):
     @model_validator(mode="after")
     def _v(self):
         _check_hard_mode(self.hard, self.match_mode)
+        if self.match_mode == MatchMode.NUMERIC:
+            for w in self.wanted:
+                float(w)  # 변환 불가면 ValueError
+        if self.match_mode == MatchMode.RANGE:
+            if self.range is None:
+                raise ValueError("RANGE는 range가 필요하다")
+            lo, hi = self.range
+            if lo > hi:
+                raise ValueError(f"range 하한>상한: {self.range}")
         return self
 
 class SearchSpec(BaseModel):
     category: str
+    category_aliases: list[str] = []   # 캐시 보존·분해용. 파서가 채운다
     constraints: list[AttributeConstraint]
 
 class AmbiguousQuery(BaseModel):
@@ -440,7 +460,7 @@ class AmbiguousQuery(BaseModel):
     options: list[str]
 ```
 
-- [ ] **Step 4: 통과** — Run: `cd apps/api && pytest tests/shared/test_search_spec.py -v` → PASS (4 tests)
+- [ ] **Step 4: 통과** — Run: `cd apps/api && pytest tests/shared/test_search_spec.py -v` → PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -688,6 +708,13 @@ def test_exclusion_hit_on_subsequence():
     c = _c(wanted=["아이폰17"], exclusions=["17 Pro"])
     assert exclusion_hit(_e("아이폰17 Pro"), c) is True
     assert exclusion_hit(_e("아이폰17"), c) is False
+
+def test_exclusion_hit_via_alias():
+    # 제외 "합성섬유"의 alias "polyester" 로도 걸려야 함
+    c = AttributeConstraint(name="소재", hard=True, match_mode=MatchMode.ENUM,
+                            wanted=["울"], exclusions=["합성섬유"],
+                            aliases={"합성섬유": ["polyester"]})
+    assert exclusion_hit(_e("polyester 양말"), c) is True
 ```
 
 - [ ] **Step 2: 실패 확인** — Run: `cd apps/api && pytest tests/matching/test_matchers.py -v` → FAIL
@@ -704,9 +731,18 @@ from raw_review.shared.text import token_seq_equal, token_subseq
 def _value(e: ExtractedAttribute) -> str:
     return e.normalized_value or e.raw_value
 
+def _canonicalize_exclusions(c: AttributeConstraint) -> list[str]:
+    # 제외값 + 각 제외값의 alias까지 포함(합성섬유 -> polyester)
+    out: list[str] = []
+    for x in c.exclusions:
+        out.append(x)
+        out.extend(c.aliases.get(x, []))
+    return out
+
 def exclusion_hit(e: ExtractedAttribute, c: AttributeConstraint) -> bool:
+    # token_subseq가 내부에서 normalize/tokenize를 적용하므로 canonical 목록만 넘기면 됨
     v = _value(e)
-    return any(token_subseq(x, v) for x in c.exclusions)
+    return any(token_subseq(x, v) for x in _canonicalize_exclusions(c))
 
 def match_exact(e: ExtractedAttribute, c: AttributeConstraint) -> bool:
     v = _value(e)
@@ -773,24 +809,29 @@ def test_synonym_direction_not_substring():
 `matchers.py`에 추가:
 
 ```python
+from raw_review.shared.text import normalize  # 공통 정규화
+
 def _canonical_set(c: AttributeConstraint) -> set[str]:
     out: set[str] = set()
     for w in c.wanted:
         out.add(w)
         for alias in c.aliases.get(w, []):
             out.add(alias)
-    return {s.lower() for s in out}
+    return {normalize(s) for s in out}  # .lower() 아니라 공통 normalize
 
 def match_enum(e: ExtractedAttribute, c: AttributeConstraint) -> bool:
-    v = (e.normalized_value or e.raw_value).lower()
+    v = normalize(e.normalized_value or e.raw_value)
     return v in _canonical_set(c)
 
 def match_synonym(e: ExtractedAttribute, c: AttributeConstraint) -> bool:
     # 방향 정규화는 추출 단계가 normalized_value에 canonical을 넣어 끝냄.
-    # 룰은 canonical 동등만 본다.
-    v = (e.normalized_value or e.raw_value).lower()
-    return v in {w.lower() for w in c.wanted}
+    # 룰은 canonical 동등만 본다. canonical 없을 때(None)의 UNCERTAIN 처리는
+    # match_attribute 디스패치(Task 10)가 담당한다.
+    v = normalize(e.normalized_value or e.raw_value)
+    return v in {normalize(w) for w in c.wanted}
 ```
+
+> 주: `match_enum`/`match_synonym`은 bool만 반환한다. SYNONYM에서 `normalized_value is None`이면 raw로 비교해 오탐할 수 있으므로, 그 경우를 `UNCERTAIN`으로 바꾸는 책임은 Task 10의 `match_attribute`에 있다(여기서는 순수 비교만).
 
 - [ ] **Step 4: 통과** — Run: `cd apps/api && pytest tests/matching/test_matchers.py -v` → PASS
 
@@ -812,14 +853,16 @@ git commit -m "feat: add ENUM/SYNONYM matchers"
 **Interfaces:**
 - Consumes: Task 7 모듈
 - Produces:
-  - `convert(value: float, from_unit: str, to_unit: str) -> float` — 길이(mm/cm/inch), 무게(g/kg). 미지원 단위 조합이면 `ValueError`.
-  - `match_numeric(e, c, *, tolerance=0.0) -> bool`
-  - `match_range(e, c) -> bool`
+  - `AttrMatch` enum: `MATCH, NOMATCH, UNCERTAIN` (NUMERIC/RANGE가 처음 삼상태 필요 → 여기서 정의, Task 10이 재사용)
+  - `convert(value: float, from_unit: str, to_unit: str) -> float` — 길이(mm/cm/inch), 무게(g/kg). 미지원/차원불일치면 `ValueError`.
+  - `match_numeric(e, c, *, tolerance=0.0) -> AttrMatch` — 단위 없음/숫자 없음 → UNCERTAIN
+  - `match_range(e, c) -> AttrMatch` — 단위 없음 → UNCERTAIN, 제시가 범위면 교집합
 
 - [ ] **Step 1: 실패 테스트 추가**
 
 ```python
-from raw_review.matching.domain.matchers import convert, match_numeric, match_range
+from raw_review.matching.domain.matchers import (
+    convert, match_numeric, match_range, AttrMatch)
 
 def test_convert_length_and_weight():
     assert convert(24.0, "cm", "mm") == 240.0
@@ -830,15 +873,33 @@ def test_numeric_with_unit_conversion():
     e = ExtractedAttribute(name="사이즈", raw_value="24cm", numeric_value=24.0, unit="cm")
     c = AttributeConstraint(name="사이즈", hard=True, match_mode=MatchMode.NUMERIC,
                             wanted=["240"], unit="mm")
-    assert match_numeric(e, c) is True
+    assert match_numeric(e, c) == AttrMatch.MATCH
 
-def test_range_contains_value():
+def test_numeric_without_unit_is_uncertain():
+    # 단위 없는 숫자를 target unit으로 가정하지 않는다
+    e = ExtractedAttribute(name="사이즈", raw_value="240", numeric_value=240.0, unit=None)
+    c = AttributeConstraint(name="사이즈", hard=True, match_mode=MatchMode.NUMERIC,
+                            wanted=["240"], unit="mm")
+    assert match_numeric(e, c) == AttrMatch.UNCERTAIN
+
+def test_range_contains_single_value():
     e = ExtractedAttribute(name="사이즈", raw_value="250", numeric_value=250.0, unit="mm")
     c = AttributeConstraint(name="사이즈", hard=True, match_mode=MatchMode.RANGE,
                             range=(240.0, 260.0), unit="mm")
-    assert match_range(e, c) is True
+    assert match_range(e, c) == AttrMatch.MATCH
     e2 = ExtractedAttribute(name="사이즈", raw_value="270", numeric_value=270.0, unit="mm")
-    assert match_range(e2, c) is False
+    assert match_range(e2, c) == AttrMatch.NOMATCH
+
+def test_range_intersection_when_mention_is_range():
+    # 제시 250~270, 원하는 240~260 → 교집합 있음
+    e = ExtractedAttribute(name="사이즈", raw_value="250~270mm",
+                           lower=250.0, upper=270.0, unit="mm")
+    c = AttributeConstraint(name="사이즈", hard=True, match_mode=MatchMode.RANGE,
+                            range=(240.0, 260.0), unit="mm")
+    assert match_range(e, c) == AttrMatch.MATCH
+    e2 = ExtractedAttribute(name="사이즈", raw_value="270~290mm",
+                            lower=270.0, upper=290.0, unit="mm")
+    assert match_range(e2, c) == AttrMatch.NOMATCH
 ```
 
 - [ ] **Step 2: 실패 확인** — Run: `cd apps/api && pytest tests/matching/test_matchers.py -v` → FAIL
@@ -846,6 +907,13 @@ def test_range_contains_value():
 - [ ] **Step 3: 구현 추가**
 
 ```python
+from enum import Enum
+
+class AttrMatch(str, Enum):
+    MATCH = "MATCH"
+    NOMATCH = "NOMATCH"
+    UNCERTAIN = "UNCERTAIN"
+
 # 기준 단위로의 배율
 _FACTORS = {
     "mm": 1.0, "cm": 10.0, "inch": 25.4,   # 길이 기준 mm
@@ -860,27 +928,40 @@ def convert(value: float, from_unit: str, to_unit: str) -> float:
         raise ValueError(f"차원 불일치: {from_unit}->{to_unit}")
     return value * _FACTORS[from_unit] / _FACTORS[to_unit]
 
-def _to_unit(e: ExtractedAttribute, unit: str | None) -> float | None:
+def _conv(value: float, from_unit: str | None, to_unit: str | None) -> float:
+    if to_unit and from_unit and to_unit != from_unit:
+        return convert(value, from_unit, to_unit)
+    return value
+
+def _unit_missing(e: ExtractedAttribute, c: AttributeConstraint) -> bool:
+    # 변환이 필요한데(제약에 단위 있음) 추출 단위가 없으면 True
+    return bool(c.unit) and not e.unit
+
+def _b(ok: bool) -> AttrMatch:
+    return AttrMatch.MATCH if ok else AttrMatch.NOMATCH
+
+def match_numeric(e: ExtractedAttribute, c: AttributeConstraint, *, tolerance: float = 0.0) -> AttrMatch:
     if e.numeric_value is None:
-        return None
-    if unit and e.unit and unit != e.unit:
-        return convert(e.numeric_value, e.unit, unit)
-    return e.numeric_value
+        return AttrMatch.UNCERTAIN
+    if _unit_missing(e, c):
+        return AttrMatch.UNCERTAIN
+    v = _conv(e.numeric_value, e.unit, c.unit)
+    return _b(any(abs(v - float(w)) <= tolerance for w in c.wanted))
 
-def match_numeric(e: ExtractedAttribute, c: AttributeConstraint, *, tolerance: float = 0.0) -> bool:
-    v = _to_unit(e, c.unit)
-    if v is None:
-        return False
-    return any(abs(v - float(w)) <= tolerance for w in c.wanted)
-
-def match_range(e: ExtractedAttribute, c: AttributeConstraint) -> bool:
+def match_range(e: ExtractedAttribute, c: AttributeConstraint) -> AttrMatch:
     if c.range is None:
-        return False
-    v = _to_unit(e, c.unit)
-    if v is None:
-        return False
+        return AttrMatch.NOMATCH  # validator가 보장하지만 방어
+    if _unit_missing(e, c):
+        return AttrMatch.UNCERTAIN
     lo, hi = c.range
-    return lo <= v <= hi
+    if e.lower is not None and e.upper is not None:
+        el = _conv(e.lower, e.unit, c.unit)
+        eu = _conv(e.upper, e.unit, c.unit)
+        return _b(not (eu < lo or el > hi))  # 교집합
+    if e.numeric_value is not None:
+        v = _conv(e.numeric_value, e.unit, c.unit)
+        return _b(lo <= v <= hi)
+    return AttrMatch.UNCERTAIN
 ```
 
 - [ ] **Step 4: 통과** — Run: `cd apps/api && pytest tests/matching/test_matchers.py -v` → PASS
@@ -934,50 +1015,55 @@ def test_dispatch_exact():
                             wanted=["아이폰17"])
     e = ExtractedAttribute(name="대상기기", raw_value="아이폰17", normalized_value="아이폰17")
     assert match_attribute(e, c) == AttrMatch.MATCH
+
+def test_synonym_without_canonical_is_uncertain():
+    # LLM이 canonical 변환 못 함 → 실제 불일치와 구분해 UNCERTAIN
+    c = AttributeConstraint(name="용도", hard=True, match_mode=MatchMode.SYNONYM,
+                            wanted=["자전거"])
+    e = ExtractedAttribute(name="용도", raw_value="라이딩", normalized_value=None)
+    assert match_attribute(e, c) == AttrMatch.UNCERTAIN
 ```
 
 - [ ] **Step 2: 실패 확인** — Run: `cd apps/api && pytest tests/matching/test_matchers.py -v` → FAIL
 
 - [ ] **Step 3: 구현 추가**
 
+`AttrMatch`는 Task 9에서 이미 정의했으므로 재정의하지 않는다. SUBSTRING 매처와 디스패치만 추가한다.
+
 ```python
-from enum import Enum
 from raw_review.shared.search_spec import MatchMode
 from raw_review.shared.text import normalize
-
-class AttrMatch(str, Enum):
-    MATCH = "MATCH"
-    NOMATCH = "NOMATCH"
-    UNCERTAIN = "UNCERTAIN"
+# AttrMatch는 같은 모듈(matchers.py) 상단에 Task 9에서 정의됨
 
 def match_substring(e: ExtractedAttribute, c: AttributeConstraint) -> bool:
     v = normalize(e.normalized_value or e.raw_value)
     return any(normalize(w) in v for w in c.wanted)
-
-def _bool(b: bool) -> AttrMatch:
-    return AttrMatch.MATCH if b else AttrMatch.NOMATCH
 
 def match_attribute(e: ExtractedAttribute | None, c: AttributeConstraint) -> AttrMatch:
     if e is None:
         return AttrMatch.UNCERTAIN
     mode = c.match_mode
     if mode == MatchMode.EXACT:
-        return _bool(match_exact(e, c))
+        return _b(match_exact(e, c))
     if mode == MatchMode.ENUM:
-        return _bool(match_enum(e, c))
+        return _b(match_enum(e, c))
     if mode == MatchMode.SYNONYM:
-        return _bool(match_synonym(e, c))
+        if e.normalized_value is None:      # canonical 변환 실패 → 불일치와 구분
+            return AttrMatch.UNCERTAIN
+        return _b(match_synonym(e, c))
     if mode == MatchMode.NUMERIC:
-        return _bool(match_numeric(e, c))
+        return match_numeric(e, c)          # 이미 AttrMatch
     if mode == MatchMode.RANGE:
-        return _bool(match_range(e, c))
+        return match_range(e, c)            # 이미 AttrMatch
     if mode == MatchMode.SUBSTRING:
-        return _bool(match_substring(e, c))
+        return _b(match_substring(e, c))
     # FREETEXT: canonical 있으면 ENUM처럼, 없으면 UNCERTAIN
     if e.normalized_value is None:
         return AttrMatch.UNCERTAIN
-    return _bool(match_enum(e, c))
+    return _b(match_enum(e, c))
 ```
+
+> 주: `_b`는 Task 9에서 정의한 bool→AttrMatch 헬퍼를 재사용한다.
 
 - [ ] **Step 4: 통과** — Run: `cd apps/api && pytest tests/matching/test_matchers.py -v` → PASS
 
@@ -1282,14 +1368,16 @@ from raw_review.shared.match_result import MentionMatch, MatchOutcome
 from raw_review.matching.domain.aspect_normalizer import AspectNormalizer
 from raw_review.matching.domain.to_opinions import to_opinions
 
-def _post():
-    return RawPost(source="dc", url="http://x/1", title="t", body="b",
-                   posted_at=datetime(2026,10,1), likes=0, comments=[])
+def _post(body="다이소 케이스 누렇게 뜸", comments=None):
+    from raw_review.shared.models import RawComment
+    return RawPost(source="dc", url="http://x/1", title="t", body=body,
+                   posted_at=datetime(2026,10,1), likes=0,
+                   comments=[RawComment(text=c) for c in (comments or [])])
 
-def _match(outcome, brand, aspect):
+def _match(outcome, brand, aspect, quote="누렇게 뜸", source_part="post"):
     m = ProductMention(raw="r", role=MentionRole.USED, brand=brand,
         opinions=[MentionOpinion(polarity=Polarity.CON, aspect=aspect,
-                                 quote="누렇게 뜸", source_part="post")])
+                                 quote=quote, source_part=source_part)])
     return MentionMatch(mention=m, outcome=outcome)
 
 def test_only_matched_opinions_converted():
@@ -1305,6 +1393,19 @@ def test_brand_none_preserved():
     ms = [_match(MatchOutcome.MATCHED, None, "변색")]
     ops = to_opinions(ms, _post(), AspectNormalizer.default())
     assert ops[0].brand is None
+
+def test_fabricated_quote_dropped():
+    # 원문에 없는 인용은 버린다
+    ms = [_match(MatchOutcome.MATCHED, "다이소", "변색", quote="절대 안 나온 문장")]
+    ops = to_opinions(ms, _post(), AspectNormalizer.default())
+    assert ops == []
+
+def test_comment_quote_verified_against_comments():
+    ms = [_match(MatchOutcome.MATCHED, "다이소", "변색",
+                 quote="변색 심하던데", source_part="comment")]
+    post = _post(body="본문엔 없음", comments=["그거 변색 심하던데 ㅋㅋ"])
+    ops = to_opinions(ms, post, AspectNormalizer.default())
+    assert len(ops) == 1
 ```
 
 - [ ] **Step 2: 실패 확인** — Run: `cd apps/api && pytest tests/matching/test_to_opinions.py -v` → FAIL
@@ -1317,7 +1418,16 @@ def test_brand_none_preserved():
 from raw_review.shared.models import RawPost
 from raw_review.shared.match_result import MentionMatch, MatchOutcome
 from raw_review.shared.verdict import Opinion
+from raw_review.shared.text import normalize
 from raw_review.matching.domain.aspect_normalizer import AspectNormalizer
+
+def _quote_in_source(quote: str, source_part: str, post: RawPost) -> bool:
+    q = normalize(quote)
+    if not q:
+        return False
+    if source_part == "comment":
+        return any(q in normalize(c.text) for c in post.comments)
+    return q in normalize(post.title + " " + post.body)
 
 def to_opinions(matches: list[MentionMatch], post: RawPost,
                 normalizer: AspectNormalizer) -> list[Opinion]:
@@ -1326,6 +1436,8 @@ def to_opinions(matches: list[MentionMatch], post: RawPost,
         if match.outcome != MatchOutcome.MATCHED:
             continue
         for op in match.mention.opinions:
+            if not _quote_in_source(op.quote, op.source_part, post):
+                continue  # 원문에 없는 인용(날조/변형)은 버림
             out.append(Opinion(
                 brand=match.mention.brand,
                 polarity=op.polarity,
@@ -1336,9 +1448,9 @@ def to_opinions(matches: list[MentionMatch], post: RawPost,
     return out
 ```
 
-> 주: 출처 url은 호출측(워커/리포트)에서 `post.url`로 연결한다. `Opinion`에 url을 넣을지는 1b 리포트 플랜에서 결정한다(현재 `source_part`만 보존). 1b에서 url이 필요하면 `Opinion`에 `url: str` 필드를 추가하고 여기서 `post.url`을 채운다.
+> 주: 출처 url은 호출측(워커/리포트)에서 `post.url`로 연결한다. `Opinion`에 url을 넣을지는 1b 리포트 플랜에서 결정한다. 1b에서 url이 필요하면 `Opinion`에 `url` 필드를 추가하고 여기서 `post.url`을 채운다. 인용 검증은 `normalize` 기준 포함이라 120자 절단 전 원문과 비교한다(절단은 저장 시).
 
-- [ ] **Step 4: 통과** — Run: `cd apps/api && pytest tests/matching/test_to_opinions.py -v` → PASS
+- [ ] **Step 4: 통과** — Run: `cd apps/api && pytest tests/matching/test_to_opinions.py -v` → PASS (4 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1484,6 +1596,7 @@ def test_settings(monkeypatch):
     s = Settings()
     assert s.model_query == "gpt-4o"
     assert s.mention_precision_floor == 0.95
+    assert s.llm_retries == 2
 ```
 
 - [ ] **Step 2: 실패 확인** — Run: `cd apps/api && pytest tests/test_config.py -v` → FAIL
@@ -1504,6 +1617,8 @@ class Settings(BaseSettings):
     resolve_confidence_floor: float = 0.6
     numeric_tolerance: float = 0.0
     mention_precision_floor: float = 0.95
+    llm_retries: int = 2            # timeout/rate limit/5xx/빈 content/schema 오류 재시도 횟수
+    llm_backoff_base: float = 0.5   # 지수 백오프 기준(초). 테스트는 0으로 주입
 
 @lru_cache
 def get_settings() -> Settings:
@@ -1555,12 +1670,23 @@ def _spec():
     return SearchSpec(category="양말", constraints=[
         AttributeConstraint(name="소재", hard=True, match_mode=MatchMode.ENUM, wanted=["울"])])
 
-async def test_high_confidence_caches_schema():
+async def test_high_confidence_caches_full_schema():
     cache = InMemorySchemaCache()
-    p = RecordingParser(ParseResult(spec=_spec(), confidence=0.9))
+    spec = SearchSpec(category="양말", category_aliases=["삭스"], constraints=[
+        AttributeConstraint(name="소재", hard=True, match_mode=MatchMode.ENUM,
+                            wanted=["울"], aliases={"울": ["메리노", "wool"]},
+                            exclusions=["합성섬유"], unit=None)])
+    p = RecordingParser(ParseResult(spec=spec, confidence=0.9))
     r = await resolve_category("울양말", p, cache)
     assert r.spec.category == "양말"
-    assert cache.get("양말") is not None
+    cached = cache.get("양말")
+    assert cached is not None
+    # 스키마 정보가 손실 없이 보존되는지
+    assert cached.category_aliases == ["삭스"]
+    attr = cached.attributes[0]
+    assert attr.canonical_values == ["울"]
+    assert attr.aliases == {"울": ["메리노", "wool"]}
+    assert attr.exclusions == ["합성섬유"]
 
 async def test_cache_hit_passes_known_schema(monkeypatch):
     cache = InMemorySchemaCache()
@@ -1628,13 +1754,22 @@ async def resolve_category(query, parser, cache, *, confidence_floor: float = 0.
         return ParseResult(ambiguous=AmbiguousQuery(query=query, options=[]),
                            confidence=result.confidence)
 
+    # 전체 스키마 보존: constraint의 모든 필드를 AttributeDef로 옮긴다
     schema = AttributeSchema(
         category=result.spec.category,
-        attributes=[AttributeDef(name=c.name, hard=c.hard, match_mode=c.match_mode)
-                    for c in result.spec.constraints])
+        category_aliases=result.spec.category_aliases,
+        attributes=[AttributeDef(
+            name=c.name, hard=c.hard, match_mode=c.match_mode,
+            canonical_values=list(c.wanted),
+            aliases=dict(c.aliases),
+            exclusions=list(c.exclusions),
+            unit=c.unit,
+        ) for c in result.spec.constraints])
     cache.put(schema)
     return result
 ```
+
+> 주: `SearchSpec.category_aliases`와 각 `AttributeConstraint`의 `wanted`/`aliases`/`exclusions`/`unit`을 그대로 `AttributeDef`로 옮겨, 캐시 히트 시 LLM에 넘기는 `known_schema`가 빈약해지지 않게 한다(리뷰 4번). `normalization`은 constraint에 없으므로 생략(스키마 정의에서만 쓰는 필드).
 
 - [ ] **Step 5: 통과 + 경계** — Run: `cd apps/api && pytest tests/catalog/test_resolve_category.py -v && python -m importlinter.cli lint` → PASS
 
@@ -1650,16 +1785,83 @@ git commit -m "feat: add CategoryResolver with alias-aware schema cache"
 ### Task 18: OpenAI 어댑터 (spec parser + mention extractor)
 
 **Files:**
+- Create: `apps/api/src/raw_review/adapters/retry.py`
 - Create: `apps/api/src/raw_review/adapters/openai_spec_parser.py`
 - Create: `apps/api/src/raw_review/adapters/openai_mention_extractor.py`
-- Test: `apps/api/tests/adapters/test_openai_spec_parser.py`, `test_openai_mention_extractor.py`
+- Test: `apps/api/tests/adapters/test_retry.py`, `test_openai_spec_parser.py`, `test_openai_mention_extractor.py`
 
 **Interfaces:**
-- Consumes: shared 모델, `ParseResult`/`ExtractResult`/`ExtractStatus` (Task 15)
+- Consumes: shared 모델, `ParseResult`/`ExtractResult`/`ExtractStatus` (Task 15), `Settings` (Task 16)
 - Produces:
-  - spec parser: `build_spec_messages(query, known_schema) -> list[dict]`, `spec_response_schema() -> dict`, `parse_spec_response(raw) -> ParseResult`, `OpenAiSpecParser(client, model)`
-  - extractor: `build_extract_messages(post, spec) -> list[dict]`, `mention_response_schema() -> dict`, `parse_extract_response(raw) -> list[ProductMention]`, `OpenAiMentionExtractor(client, model)` — 빈 결과 1회 재시도, 실패 시 `status=UNANALYZED`
-- 주: 네트워크 호출 단위테스트 안 함. 순수 함수(build/schema/parse)만 테스트. strict json_schema는 상위 spec의 `_strict` 재귀 방식 사용.
+  - retry: `async with_retry(fn, *, retries, backoff_base, retry_on: tuple[type,...]) -> T` — `retry_on` 예외를 지수 백오프로 재시도, 소진 시 마지막 예외 re-raise
+  - spec parser: `build_spec_messages`, `spec_response_schema`, `parse_spec_response`, `OpenAiSpecParser(client, model, *, retries, backoff_base)` — 재시도 적용
+  - extractor: `build_extract_messages`, `mention_response_schema`, `parse_extract_response`, `OpenAiMentionExtractor(client, model, *, retries, backoff_base)` — **정상 빈 응답=EMPTY(재시도 안 함), 예외(timeout/rate limit/5xx/빈 content/schema)=재시도 후 UNANALYZED**
+- 주: 네트워크 호출 단위테스트 안 함. 순수 함수(build/schema/parse)와 retry 로직(fake coro)만 테스트. strict json_schema는 `strict()` 재귀 방식.
+
+- [ ] **Step 1a: retry 실패 테스트**
+
+`tests/adapters/test_retry.py`:
+
+```python
+import pytest
+from raw_review.adapters.retry import with_retry
+
+async def test_retries_then_succeeds():
+    calls = {"n": 0}
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise TimeoutError("일시적")
+        return "ok"
+    result = await with_retry(flaky, retries=3, backoff_base=0.0,
+                              retry_on=(TimeoutError,))
+    assert result == "ok" and calls["n"] == 3
+
+async def test_reraises_after_exhausting():
+    async def always_fail():
+        raise TimeoutError("계속 실패")
+    with pytest.raises(TimeoutError):
+        await with_retry(always_fail, retries=2, backoff_base=0.0,
+                         retry_on=(TimeoutError,))
+
+async def test_non_retryable_raises_immediately():
+    calls = {"n": 0}
+    async def boom():
+        calls["n"] += 1
+        raise KeyError("재시도 대상 아님")
+    with pytest.raises(KeyError):
+        await with_retry(boom, retries=3, backoff_base=0.0,
+                         retry_on=(TimeoutError,))
+    assert calls["n"] == 1  # 재시도 안 함
+```
+
+- [ ] **Step 1b: retry 구현**
+
+`src/raw_review/adapters/retry.py`:
+
+```python
+import asyncio
+from typing import Awaitable, Callable, TypeVar
+
+T = TypeVar("T")
+
+async def with_retry(fn: Callable[[], Awaitable[T]], *, retries: int,
+                     backoff_base: float, retry_on: tuple[type, ...]) -> T:
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await fn()
+        except retry_on as e:          # retry_on에 없는 예외는 즉시 전파
+            last = e
+            if attempt == retries:
+                raise
+            if backoff_base > 0:
+                await asyncio.sleep(backoff_base * (2 ** attempt))
+    assert last is not None
+    raise last
+```
+
+- [ ] **Step 1c: retry 통과** — Run: `cd apps/api && pytest tests/adapters/test_retry.py -v` → PASS
 
 - [ ] **Step 1: 실패 테스트 (parser 순수함수)**
 
@@ -1729,6 +1931,17 @@ import json
 from pydantic import BaseModel, ValidationError
 from raw_review.shared.search_spec import SearchSpec, AttributeSchema, AmbiguousQuery
 from raw_review.shared.ports import ParseResult
+from raw_review.adapters.retry import with_retry
+
+# 재시도 대상 예외: OpenAI 일시적 오류 + 파싱/빈 content(ValueError).
+# openai 미설치 환경(단위테스트)에서도 import 되도록 방어적으로 모은다.
+try:
+    from openai import (APITimeoutError, RateLimitError,
+                        InternalServerError, APIConnectionError)
+    RETRYABLE: tuple[type, ...] = (APITimeoutError, RateLimitError,
+                                   InternalServerError, APIConnectionError, ValueError)
+except Exception:  # pragma: no cover
+    RETRYABLE = (ValueError,)
 
 def strict(schema: dict) -> dict:
     if schema.get("type") == "object":
@@ -1780,15 +1993,23 @@ def parse_spec_response(raw: str) -> ParseResult:
     return ParseResult(spec=env.spec, ambiguous=env.ambiguous, confidence=env.confidence)
 
 class OpenAiSpecParser:
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, *, retries: int = 2, backoff_base: float = 0.5):
         self._client = client; self._model = model
+        self._retries = retries; self._backoff = backoff_base
+
     async def parse(self, query: str, known_schema: AttributeSchema | None = None) -> ParseResult:
-        resp = await self._client.chat.completions.create(
-            model=self._model, temperature=0,
-            messages=build_spec_messages(query, known_schema),
-            response_format={"type": "json_schema", "json_schema": {
-                "name": "spec_envelope", "schema": spec_response_schema(), "strict": True}})
-        return parse_spec_response(resp.choices[0].message.content)
+        async def _call() -> ParseResult:
+            resp = await self._client.chat.completions.create(
+                model=self._model, temperature=0,
+                messages=build_spec_messages(query, known_schema),
+                response_format={"type": "json_schema", "json_schema": {
+                    "name": "spec_envelope", "schema": spec_response_schema(), "strict": True}})
+            content = resp.choices[0].message.content
+            if not content:
+                raise ValueError("빈 content")
+            return parse_spec_response(content)  # schema 오류 시 ValueError
+        return await with_retry(_call, retries=self._retries, backoff_base=self._backoff,
+                                retry_on=RETRYABLE)
 ```
 
 - [ ] **Step 4: mention extractor 구현**
@@ -1802,7 +2023,8 @@ from raw_review.shared.models import RawPost
 from raw_review.shared.search_spec import SearchSpec
 from raw_review.shared.mention import ProductMention
 from raw_review.shared.ports import ExtractResult, ExtractStatus
-from raw_review.adapters.openai_spec_parser import strict
+from raw_review.adapters.openai_spec_parser import strict, RETRYABLE
+from raw_review.adapters.retry import with_retry
 
 class _Envelope(BaseModel):
     mentions: list[ProductMention] = []
@@ -1829,8 +2051,9 @@ def parse_extract_response(raw: str) -> list[ProductMention]:
         raise ValueError(f"추출 파싱 실패: {e}") from e
 
 class OpenAiMentionExtractor:
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, *, retries: int = 2, backoff_base: float = 0.5):
         self._client = client; self._model = model
+        self._retries = retries; self._backoff = backoff_base
 
     async def _call(self, post: RawPost, spec: SearchSpec) -> list[ProductMention]:
         resp = await self._client.chat.completions.create(
@@ -1838,32 +2061,35 @@ class OpenAiMentionExtractor:
             messages=build_extract_messages(post, spec),
             response_format={"type": "json_schema", "json_schema": {
                 "name": "mentions", "schema": mention_response_schema(), "strict": True}})
-        return parse_extract_response(resp.choices[0].message.content)
+        content = resp.choices[0].message.content
+        if not content:
+            raise ValueError("빈 content")
+        return parse_extract_response(content)   # schema 오류 시 ValueError
 
     async def extract(self, post: RawPost, spec: SearchSpec) -> ExtractResult:
-        for attempt in range(2):  # 1회 재시도
-            try:
-                mentions = await self._call(post, spec)
-            except ValueError:
-                if attempt == 1:
-                    return ExtractResult(mentions=[], status=ExtractStatus.UNANALYZED)
-                continue
-            if mentions:
-                return ExtractResult(mentions=mentions, status=ExtractStatus.OK)
-            if attempt == 1:
-                return ExtractResult(mentions=[], status=ExtractStatus.UNANALYZED)
-        return ExtractResult(mentions=[], status=ExtractStatus.UNANALYZED)
+        # 예외(timeout/rate limit/5xx/빈 content/schema)는 재시도, 소진 시 UNANALYZED.
+        # 정상 빈 응답은 재시도하지 않고 EMPTY(관련 언급 없음).
+        try:
+            mentions = await with_retry(
+                lambda: self._call(post, spec),
+                retries=self._retries, backoff_base=self._backoff, retry_on=RETRYABLE)
+        except Exception:
+            return ExtractResult(mentions=[], status=ExtractStatus.UNANALYZED)
+        if mentions:
+            return ExtractResult(mentions=mentions, status=ExtractStatus.OK)
+        return ExtractResult(mentions=[], status=ExtractStatus.EMPTY)  # 정상 빈 응답
 ```
 
-> 주: strict json_schema가 특정 모델에서 거부되면 `json_object` + 수동 검증으로 폴백하고 사유를 커밋에 남긴다(상위 spec과 동일 방침).
+> 주1: **EMPTY ≠ UNANALYZED.** 정상 응답인데 상품 언급이 없음=EMPTY("후기 없음"), 호출 실패=UNANALYZED("분석 못 함"). 통계·리포트에서 따로 집계한다.
+> 주2: strict json_schema가 특정 모델에서 거부되면 `json_object` + 수동 검증으로 폴백하고 사유를 커밋에 남긴다.
 
 - [ ] **Step 5: 통과** — Run: `cd apps/api && pytest tests/adapters -v` → PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add apps/api/src/raw_review/adapters/openai_spec_parser.py apps/api/src/raw_review/adapters/openai_mention_extractor.py apps/api/tests/adapters/test_openai_spec_parser.py apps/api/tests/adapters/test_openai_mention_extractor.py
-git commit -m "feat: add OpenAI spec parser and mention extractor"
+git add apps/api/src/raw_review/adapters/retry.py apps/api/src/raw_review/adapters/openai_spec_parser.py apps/api/src/raw_review/adapters/openai_mention_extractor.py apps/api/tests/adapters
+git commit -m "feat: add OpenAI adapters with retry and EMPTY/UNANALYZED split"
 ```
 
 ---
@@ -1880,9 +2106,10 @@ git commit -m "feat: add OpenAI spec parser and mention extractor"
 - Consumes: `match_mention` (Task 12), shared 모델, `Settings` (Task 16)
 - Produces:
   - `precision(tp, fp)`, `recall(tp, fn)`
-  - `evaluate(cases) -> EvalReport(mention_precision, mention_recall, excluded_fp, target_fn, n)` — 각 케이스는 라벨된 언급 + 기대 채택 여부
-  - `by_category(cases) -> dict[str, EvalReport]`
+  - `evaluate(cases) -> EvalReport(mention_precision, mention_recall, excluded_fp, target_fn, n)`
+  - `by_category(cases) -> dict[str, EvalReport]`, `by_scenario(cases) -> dict[str, EvalReport]`
   - `comparison_only(cases) -> EvalReport`
+  - `role_accuracy(cases) -> float` — 라벨 `expected_role` 대비 언급 `role` 일치율. 1단계는 계산 함수만 검증(룰 입력 role이 라벨과 같아 1.0), 실측은 2단계 LLM 추출 eval에서.
 
 - [ ] **Step 1: metrics 실패 테스트**
 
@@ -1935,27 +2162,39 @@ def evaluate(cases) -> EvalReport:
     return EvalReport(mention_precision=precision(tp, fp), mention_recall=recall(tp, fn),
                       excluded_fp=excluded_fp, target_fn=target_fn, n=len(cases))
 
-def by_category(cases) -> dict:
-    cats: dict[str, list] = {}
+def _group(cases, key) -> dict:
+    out: dict[str, list] = {}
     for c in cases:
-        cats.setdefault(c["category_group"], []).append(c)
-    return {g: evaluate(cs) for g, cs in cats.items()}
+        out.setdefault(c[key], []).append(c)
+    return {g: evaluate(cs) for g, cs in out.items()}
+
+def by_category(cases) -> dict:
+    return _group(cases, "category_group")
+
+def by_scenario(cases) -> dict:
+    return _group(cases, "scenario")
 
 def comparison_only(cases) -> EvalReport:
-    return evaluate([c for c in cases if c.get("is_comparison")])
+    return evaluate([c for c in cases if c.get("scenario") == "비교"])
+
+def role_accuracy(cases) -> float:
+    if not cases:
+        return 1.0
+    hit = sum(1 for c in cases if c["predicted_role"] == c["expected_role"])
+    return hit / len(cases)
 ```
 
 - [ ] **Step 4: 골든셋 작성**
 
-`tests/eval/golden_cases.jsonl` — 카테고리군(휴대폰/액세서리, 의류/신발, 스포츠용품, 생활가전, 기타) × 상황(정상·유사·제외·비교·애매·광고) 분포로 손 라벨. 각 줄: `category_group`, `is_comparison`, `spec`, `mention`(ProductMention dict), `expected_matched`(bool). 각 카테고리군 최소 4건, 총 20건+. 비교 글 케이스 최소 4건. 예시 3줄:
+`tests/eval/golden_cases.jsonl` — 카테고리군(휴대폰/액세서리, 의류/신발, 스포츠용품, 생활가전, 기타) × `scenario`(정상·유사·제외·비교·애매·광고) 분포로 손 라벨. 각 줄: `category_group`, `scenario`, `spec`, `mention`, `expected_matched`(bool), `expected_role`. **각 category_group ≥ 4, 각 scenario ≥ 2**, 총 24건+. 예시 3줄:
 
 ```json
-{"category_group": "의류/신발", "is_comparison": true, "spec": {"category": "양말", "constraints": [{"name": "소재", "hard": true, "match_mode": "ENUM", "wanted": ["울"], "aliases": {"울": ["메리노"]}}]}, "mention": {"raw": "면양말은 보풀 심했다", "role": "COMPARED", "brand": "무지", "attributes": [{"name": "소재", "raw_value": "면", "normalized_value": "면"}], "opinions": []}, "expected_matched": false}
-{"category_group": "의류/신발", "is_comparison": true, "spec": {"category": "양말", "constraints": [{"name": "소재", "hard": true, "match_mode": "ENUM", "wanted": ["울"], "aliases": {"울": ["메리노"]}}]}, "mention": {"raw": "울양말은 따뜻했다", "role": "USED", "brand": "데카트론", "attributes": [{"name": "소재", "raw_value": "메리노", "normalized_value": "울"}], "opinions": [{"polarity": "pro", "aspect": "보온", "quote": "따뜻", "source_part": "post"}]}, "expected_matched": true}
-{"category_group": "휴대폰/액세서리", "is_comparison": true, "spec": {"category": "휴대폰케이스", "constraints": [{"name": "대상기기", "hard": true, "match_mode": "EXACT", "wanted": ["아이폰17"], "exclusions": ["17 Pro"]}, {"name": "형태", "hard": true, "match_mode": "ENUM", "wanted": ["투명"], "aliases": {"투명": ["클리어"]}}]}, "mention": {"raw": "17 Pro는 안 맞았다", "role": "REJECTED_ALT", "brand": "슈피겐", "attributes": [{"name": "대상기기", "raw_value": "아이폰17 Pro", "normalized_value": "아이폰17 Pro"}, {"name": "형태", "raw_value": "투명", "normalized_value": "투명"}], "opinions": []}, "expected_matched": false}
+{"category_group": "의류/신발", "scenario": "비교", "spec": {"category": "양말", "constraints": [{"name": "소재", "hard": true, "match_mode": "ENUM", "wanted": ["울"], "aliases": {"울": ["메리노"]}}]}, "mention": {"raw": "면양말은 보풀 심했다", "role": "COMPARED", "brand": "무지", "attributes": [{"name": "소재", "raw_value": "면", "normalized_value": "면"}], "opinions": []}, "expected_matched": false, "expected_role": "COMPARED"}
+{"category_group": "의류/신발", "scenario": "정상", "spec": {"category": "양말", "constraints": [{"name": "소재", "hard": true, "match_mode": "ENUM", "wanted": ["울"], "aliases": {"울": ["메리노"]}}]}, "mention": {"raw": "울양말은 따뜻했다", "role": "USED", "brand": "데카트론", "attributes": [{"name": "소재", "raw_value": "메리노", "normalized_value": "울"}], "opinions": [{"polarity": "pro", "aspect": "보온", "quote": "따뜻", "source_part": "post"}]}, "expected_matched": true, "expected_role": "USED"}
+{"category_group": "휴대폰/액세서리", "scenario": "제외", "spec": {"category": "휴대폰케이스", "constraints": [{"name": "대상기기", "hard": true, "match_mode": "EXACT", "wanted": ["아이폰17"], "exclusions": ["17 Pro"]}, {"name": "형태", "hard": true, "match_mode": "ENUM", "wanted": ["투명"], "aliases": {"투명": ["클리어"]}}]}, "mention": {"raw": "아이폰17 Pro 투명케이스 변색", "role": "USED", "brand": "슈피겐", "attributes": [{"name": "대상기기", "raw_value": "아이폰17 Pro", "normalized_value": "아이폰17 Pro"}, {"name": "형태", "raw_value": "투명", "normalized_value": "투명"}], "opinions": []}, "expected_matched": false, "expected_role": "USED"}
 ```
 
-> 주: 20건 이상을 손으로 채운다. 분포 균형(카테고리군·상황)을 지킨다. 2단계 수집 후 실제 라벨로 확장하고 LLM precision/recall 게이트(100건+)를 추가한다.
+> 주: 24건 이상을 손으로 채운다. scenario 6종 각 ≥ 2, category_group 5종 중 ≥ 4개 등장. 2단계 수집 후 실제 라벨로 확장하고 LLM precision/recall·role 게이트(100건+)를 추가한다.
 
 - [ ] **Step 5: 로더 + 평가 테스트**
 
@@ -1981,23 +2220,29 @@ def golden_cases():
 `tests/eval/test_matching_eval.py`에 추가:
 
 ```python
+from collections import Counter
 from raw_review.shared.match_result import MatchOutcome
 from raw_review.matching.domain.mention_matcher import match_mention
-from raw_review.eval.metrics import evaluate, by_category, comparison_only
+from raw_review.eval.metrics import (
+    evaluate, by_category, by_scenario, comparison_only, role_accuracy)
 from raw_review.config import get_settings
+
+_SCENARIOS = ["정상", "유사", "제외", "비교", "애매", "광고"]
 
 def _run(golden_cases):
     rows = []
     for c in golden_cases:
         outcome = match_mention(c["mention_obj"], c["spec_obj"]).outcome
-        rows.append({**c, "predicted_matched": outcome == MatchOutcome.MATCHED})
+        rows.append({**c, "predicted_matched": outcome == MatchOutcome.MATCHED,
+                     "predicted_role": c["mention_obj"].role.value})
     return rows
 
 def test_dataset_distribution(golden_cases):
-    assert len(golden_cases) >= 20
-    groups = {c["category_group"] for c in golden_cases}
-    assert len(groups) >= 4
-    assert sum(1 for c in golden_cases if c.get("is_comparison")) >= 4
+    assert len(golden_cases) >= 24
+    assert len({c["category_group"] for c in golden_cases}) >= 4
+    scen = Counter(c["scenario"] for c in golden_cases)
+    for s in _SCENARIOS:
+        assert scen[s] >= 2, f"시나리오 '{s}' 최소 2건 필요, 현재 {scen[s]}"
 
 def test_mention_precision_meets_floor(golden_cases):
     report = evaluate(_run(golden_cases))
@@ -2005,11 +2250,16 @@ def test_mention_precision_meets_floor(golden_cases):
     assert report.excluded_fp == 0  # 제외/비대상 언급을 채택하지 않음
 
 def test_comparison_cases_no_leak(golden_cases):
-    report = comparison_only(_run(golden_cases))
-    assert report.excluded_fp == 0
+    assert comparison_only(_run(golden_cases)).excluded_fp == 0
 
-def test_per_category_available(golden_cases):
-    assert len(by_category(_run(golden_cases))) >= 4
+def test_per_category_and_scenario_reports(golden_cases):
+    rows = _run(golden_cases)
+    assert len(by_category(rows)) >= 4
+    assert len(by_scenario(rows)) >= 6
+
+def test_role_accuracy_computable(golden_cases):
+    # 1단계: 입력 role이 라벨과 같아 1.0. 함수 동작만 검증(실측은 2단계 추출 eval)
+    assert role_accuracy(_run(golden_cases)) == 1.0
 ```
 
 - [ ] **Step 6: 통과 + 전체 + 경계** — Run: `cd apps/api && pytest -v && python -m importlinter.cli lint` → 전부 PASS
@@ -2023,31 +2273,161 @@ git commit -m "feat: add matching eval metrics and category-distributed golden s
 
 ---
 
-## Self-Review 결과
+### Task 20: 글 1건 분석 오케스트레이션 (analyze_post)
+
+매칭 엔진이 "CategoryResolver 다음, ReportBuilder 앞"의 글 단위 조립 지점을 제공한다. CoarseGate → extract → match → to_opinions를 묶는다. 검색 전체 조립은 1b `run_search`.
+
+**Files:**
+- Create: `apps/api/src/raw_review/shared/analysis.py` (PostAnalysis)
+- Create: `apps/api/src/raw_review/matching/application/analyze_post.py` (+ `application/__init__.py`)
+- Test: `apps/api/tests/matching/test_analyze_post.py`
+
+**Interfaces:**
+- Consumes: `has_any_signal` (Task 11), `match_post` (Task 12), `to_opinions` (Task 14), `MentionExtractor`/`ExtractResult`/`ExtractStatus` (Task 15), `AspectNormalizer` (Task 13)
+- Produces:
+  - `PostAnalysis(url, source, posted_at, likes, status: ExtractStatus, opinions: list[Opinion])`
+  - `async analyze_post(post, spec, extractor, normalizer) -> PostAnalysis`
+  - 흐름: CoarseGate 탈락 → `EMPTY`, opinions=[]. extract status≠OK → 그 status, opinions=[]. OK → match_post → to_opinions.
+
+- [ ] **Step 1: 실패 테스트**
+
+`tests/matching/test_analyze_post.py`:
+
+```python
+from datetime import datetime
+from raw_review.shared.models import RawPost
+from raw_review.shared.search_spec import SearchSpec, AttributeConstraint, MatchMode
+from raw_review.shared.mention import ProductMention, MentionRole, ExtractedAttribute, MentionOpinion
+from raw_review.shared.verdict import Polarity
+from raw_review.shared.ports import ExtractResult, ExtractStatus
+from raw_review.adapters.fakes import FakeMentionExtractor
+from raw_review.matching.domain.aspect_normalizer import AspectNormalizer
+from raw_review.matching.application.analyze_post import analyze_post
+
+def _spec():
+    return SearchSpec(category="양말", constraints=[
+        AttributeConstraint(name="소재", hard=True, match_mode=MatchMode.ENUM,
+                            wanted=["울"], aliases={"울": ["메리노"]})])
+
+def _post(url, body):
+    return RawPost(source="dc", url=url, title="양말 후기", body=body,
+                   posted_at=datetime(2026,10,1), likes=4, comments=[])
+
+def _mention():
+    return ProductMention(raw="데카트론 울양말 보풀", role=MentionRole.USED, brand="데카트론",
+        attributes=[ExtractedAttribute(name="소재", raw_value="메리노", normalized_value="울")],
+        opinions=[MentionOpinion(polarity=Polarity.CON, aspect="보풀",
+                                 quote="보풀 심함", source_part="post")])
+
+async def test_coarse_gate_blocks_no_signal():
+    post = _post("u0", "오늘 날씨 얘기")  # 키워드 없음
+    r = await analyze_post(post, _spec(), FakeMentionExtractor({}), AspectNormalizer.default())
+    assert r.status == ExtractStatus.EMPTY and r.opinions == []
+
+async def test_matched_opinions_flow_through():
+    post = _post("u1", "데카트론 울양말 보풀 심함")
+    ext = FakeMentionExtractor({"u1": ExtractResult(mentions=[_mention()], status=ExtractStatus.OK)})
+    r = await analyze_post(post, _spec(), ext, AspectNormalizer.default())
+    assert r.status == ExtractStatus.OK
+    assert len(r.opinions) == 1 and r.opinions[0].brand == "데카트론"
+    assert r.source == "dc" and r.likes == 4
+
+async def test_unanalyzed_passes_status():
+    post = _post("u2", "울양말 메리노 좋음")
+    ext = FakeMentionExtractor({"u2": ExtractResult(mentions=[], status=ExtractStatus.UNANALYZED)})
+    r = await analyze_post(post, _spec(), ext, AspectNormalizer.default())
+    assert r.status == ExtractStatus.UNANALYZED and r.opinions == []
+```
+
+- [ ] **Step 2: 실패 확인** — Run: `cd apps/api && pytest tests/matching/test_analyze_post.py -v` → FAIL
+
+- [ ] **Step 3: PostAnalysis 구현**
+
+`src/raw_review/shared/analysis.py`:
+
+```python
+from datetime import datetime
+from pydantic import BaseModel
+from raw_review.shared.verdict import Opinion
+from raw_review.shared.ports import ExtractStatus
+
+class PostAnalysis(BaseModel):
+    url: str
+    source: str
+    posted_at: datetime | None = None
+    likes: int = 0
+    status: ExtractStatus
+    opinions: list[Opinion] = []
+```
+
+- [ ] **Step 4: analyze_post 구현**
+
+`src/raw_review/matching/application/analyze_post.py`:
+
+```python
+from raw_review.shared.models import RawPost
+from raw_review.shared.search_spec import SearchSpec
+from raw_review.shared.ports import ExtractStatus
+from raw_review.shared.analysis import PostAnalysis
+from raw_review.matching.domain.coarse_gate import has_any_signal
+from raw_review.matching.domain.mention_matcher import match_post
+from raw_review.matching.domain.to_opinions import to_opinions
+
+def _base(post: RawPost, status: ExtractStatus, opinions=None) -> PostAnalysis:
+    return PostAnalysis(url=post.url, source=post.source, posted_at=post.posted_at,
+                        likes=post.likes, status=status, opinions=opinions or [])
+
+async def analyze_post(post: RawPost, spec: SearchSpec, extractor, normalizer) -> PostAnalysis:
+    if not has_any_signal(post, spec):
+        return _base(post, ExtractStatus.EMPTY)
+    result = await extractor.extract(post, spec)
+    if result.status != ExtractStatus.OK:
+        return _base(post, result.status)
+    matches = match_post(result.mentions, spec)
+    opinions = to_opinions(matches, post, normalizer)
+    return _base(post, ExtractStatus.OK, opinions)
+```
+
+- [ ] **Step 5: 통과 + 경계** — Run: `cd apps/api && pytest tests/matching/test_analyze_post.py -v && python -m importlinter.cli lint` → PASS
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add apps/api/src/raw_review/shared/analysis.py apps/api/src/raw_review/matching/application apps/api/tests/matching/test_analyze_post.py
+git commit -m "feat: add per-post analyze orchestration service"
+```
+
+---
+
+## Self-Review 결과 (2차 개정 — 13개 지적 반영)
 
 **1. Spec coverage**
-- 구조화 AttributeSchema/SearchSpec + match_mode validator: Task 4 ✓
-- MatchMode 7종 매처(EXACT 경계/ENUM/SYNONYM 방향/NUMERIC·RANGE 단위/SUBSTRING·FREETEXT): Task 7-10 ✓
-- ProductMention(role, ExtractedAttribute): Task 5 ✓
-- CoarseGate: Task 11 ✓
-- MentionMatcher(role 필터, USED 제외, 하드 누락 UNCERTAIN): Task 12 ✓
-- Opinion 변환 계약: Task 14 ✓
-- CategoryResolver(캐시 읽기, 별칭): Task 17 ✓
-- 2-tier OpenAI 어댑터(json_schema, 빈추출 재시도→UNANALYZED): Task 18 ✓
-- eval 지표 함수(precision/recall/excluded_fp/target_fn/카테고리별/비교전용) + 분산 골든셋: Task 19 ✓
-- 공유커널 경계: Task 1, 재확인 15/17/19 ✓
+- 구조화 AttributeSchema/SearchSpec(+category_aliases) + validator(hard mode, NUMERIC 숫자, RANGE lo≤hi): Task 4 ✓
+- MatchMode 매처 삼상태(EXACT 경계/ENUM/SYNONYM/NUMERIC·RANGE 교집합·단위/SUBSTRING/FREETEXT): Task 7-10 ✓
+- ProductMention(role, ExtractedAttribute 숫자/범위): Task 5 ✓
+- CoarseGate: Task 11 / MentionMatcher: Task 12 / AspectNormalizer: Task 13 ✓
+- to_opinions(+인용 원문 검증): Task 14 ✓
+- CategoryResolver(전체 스키마 캐시 보존): Task 17 ✓
+- OpenAI 어댑터(json_schema, retry, EMPTY/UNANALYZED 분리): Task 18 ✓
+- eval(precision/excluded_fp/target_fn/by_category/by_scenario/role_accuracy) + scenario 분산 골든셋: Task 19 ✓
+- **글 1건 오케스트레이션 analyze_post**: Task 20 ✓ (검색 전체 run_search는 1b)
+- 공유커널 경계: Task 1, 재확인 15/17/19/20 ✓
 
-**2. 리뷰 10개 지적 반영**
-1. ProductMention 숫자/범위 → `ExtractedAttribute`(numeric/lower/upper/unit): Task 5 ✓
-2. FREETEXT 충돌 → LLM canonical 변환, 없으면 UNCERTAIN, soft 전용: Task 4(validator), 10 ✓
-3. 추출 누락 → recall 우선 + 빈배열 1회 재시도 + UNANALYZED: Task 18 ✓
-4. 제외·부정·비교 → role 필터, 제외는 USED subject에만: Task 12 ✓
-5. SYNONYM 방향 → canonical 동등, 추출이 방향 처리: Task 8 ✓
-6. SUBSTRING hard 금지 → validator: Task 4 ✓
-7. Opinion 변환 계약 → `to_opinions`, brand None 버킷, 출처: Task 14 ✓
-8. 평가 지표 함수 → Task 19 ✓
-9. 하드 누락 REJECT/UNCERTAIN → UNCERTAIN 확정: Task 12 ✓
+**2. 2차 리뷰 13개 지적 반영**
+1. 매칭↔리포트 orchestration 끊김 → 1a `analyze_post`(Task 20) + 1b `run_search`(별도 플랜) ✓
+2. spec/plan 반환 타입 불일치 → spec을 `ExtractResult`/`AttrMatch` 삼상태로 통일(spec §4.2/§6) ✓
+3. NUMERIC/RANGE → `lower/upper` 교집합, 단위 없음 UNCERTAIN, 모델 validator(숫자·lo≤hi): Task 4, 9 ✓
+4. CategoryResolver 캐시 스키마 손실 → 전체 필드(canonical/aliases/exclusions/unit/category_aliases) 보존: Task 17 ✓
+5. EMPTY≠UNANALYZED → 정상 빈 응답=EMPTY, 예외=UNANALYZED: Task 18 ✓
+6. exclusion_hit alias/정규화 → canonical+normalize: Task 7 ✓
+7. match_enum 공통 정규화 → `.lower()` 제거, `normalize()`: Task 8 ✓
+8. SYNONYM canonical 실패 → UNCERTAIN: Task 10 ✓
+9. 인용 원문 검증 → `_quote_in_source`, 없으면 버림: Task 14 ✓
+10. role 근거·지표 → `mention.raw` 필수, `role_accuracy`, 애매 role=MENTIONED: Task 5/19, spec ✓
+11. 골든셋 분포 자동 검증 → `scenario` 필드, scenario별 ≥2: Task 19 ✓
+12. 재시도 범위 → timeout/rate limit/5xx/빈 content/schema + 백오프, spec parser 포함: Task 18 ✓
+13. 폐기 플랜 혼동 → analysis-core 플랜 archive로 축소(별도 처리) ✓
 
-**3. Placeholder scan**: 모든 코드 스텝에 실제 코드. golden_cases.jsonl은 포맷 예시 3줄 + 20건 분산 지침. to_opinions의 url은 1b 종속으로 명시 ✓
+**3. Placeholder scan**: 모든 코드 스텝에 실제 코드. golden_cases.jsonl은 예시 3줄 + 24건 분산 지침. to_opinions url은 1b 종속 명시 ✓
 
-**4. Type consistency**: `ExtractedAttribute`, `ProductMention`, `MentionMatch`, `MatchOutcome`, `AttrMatch`, `SearchSpec`, `AttributeConstraint`, `ParseResult`, `ExtractResult`가 정의(shared/ports)와 소비(matching/catalog/adapters/eval) 전반 동일 ✓
+**4. Type consistency**: `ExtractedAttribute`/`ProductMention`/`MentionMatch`/`AttrMatch`/`ExtractResult`/`PostAnalysis`/`SearchSpec`(+category_aliases)/`AttributeConstraint`가 정의(shared/ports)와 소비(matching/catalog/adapters/eval) 전반 동일. 매처 NUMERIC/RANGE는 `AttrMatch` 반환(Task 9), 나머지는 디스패치에서 래핑(Task 10) ✓

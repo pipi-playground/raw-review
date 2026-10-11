@@ -94,6 +94,7 @@ class AttributeConstraint(BaseModel):
 
 class SearchSpec(BaseModel):
     category: str
+    category_aliases: list[str] = []   # 캐시 보존·분해용. 파서가 채운다
     constraints: list[AttributeConstraint]
 
 class AmbiguousQuery(BaseModel):
@@ -102,6 +103,10 @@ class AmbiguousQuery(BaseModel):
 ```
 
 전역 제외어 없음. 제외는 항상 속성 단위 canonical.
+
+**모델 단계 검증(validator)**:
+- `AttributeConstraint`: `match_mode == NUMERIC`이면 `wanted`의 모든 값이 float로 변환 가능해야 한다. `match_mode == RANGE`이면 `range`가 있어야 하고 `range[0] <= range[1]`.
+- `AttributeDef`/`AttributeConstraint`: hard면 mode ∈ {EXACT,ENUM,NUMERIC,RANGE,SYNONYM}.
 
 ### 3.3 상품 언급 (ProductMention)
 
@@ -164,24 +169,39 @@ class MentionMatch(BaseModel):
 
 ### 4.2 MatchMode 매처 (결정적 룰)
 
-mode별 순수 함수 `match(extracted: ExtractedAttribute, c: AttributeConstraint) -> bool`. 호출 전에 `c.exclusions` 검사는 상위(MentionMatcher)가 한다.
+공식 반환은 **삼상태** `AttrMatch ∈ {MATCH, NOMATCH, UNCERTAIN}`. 디스패치 함수가 계약이다.
 
-- **EXACT**: 정규화 후 **토큰 경계 일치**. `아이폰17`이 `아이폰17pro`에 부분 포함돼도 매칭 아님. 경계는 한글/영문/숫자 전이와 공백·구분자로 토큰을 끊어 비교.
-- **ENUM**: `normalized_value`가 `wanted`(canonical 집합)에 속하는지.
-- **SYNONYM**: **방향 있는 alias→canonical**. 추출 단계에서 LLM이 이미 canonical(`normalized_value`)을 넣음. 룰은 canonical 동등 비교. "라이딩 글러브"→용도:자전거, "오토바이 라이딩 장갑"→용도:오토바이. "라이딩" substring으로 자전거 오인 안 함.
-- **NUMERIC**: 단위 변환 후 `numeric_value`와 `wanted` 숫자 비교(허용 오차 설정값).
-- **RANGE**: `wanted`가 범위고 제시가 단일이면 포함 검사. 제시가 범위(`lower`/`upper`)면 교집합 여부.
-- **SUBSTRING**: 느슨한 포함. **soft 전용**. precision 게이트에서 사용분을 별도 측정.
-- **FREETEXT**: 룰 직접 판정 불가. `normalized_value`가 있으면 ENUM처럼 비교, 없으면 UNCERTAIN. **soft 전용.**
+```python
+class AttrMatch(str, Enum):
+    MATCH; NOMATCH; UNCERTAIN
+
+def match_attribute(e: ExtractedAttribute | None, c: AttributeConstraint) -> AttrMatch
+```
+
+- 추출값 `e is None` → `UNCERTAIN`(하드 속성 누락).
+- 모든 문자열 비교(ENUM/SYNONYM/EXACT 토큰화/제외)는 **공통 `shared.text.normalize`** 를 거친다. "메리 노"=="메리노", 공백·대소문자 무시.
+- **EXACT**: 토큰 시퀀스 **완전 일치**(`token_seq_equal`). `아이폰17`이 `아이폰17 Pro`와 일치 아님(부분문자열 금지). 경계는 한글/영문/숫자 전이·구분자로 끊는다.
+- **ENUM**: `normalized_value`(canonical)를 `wanted ∪ aliases`의 canonical 집합과 비교. 전부 normalize 적용.
+- **SYNONYM**: canonical 동등. 추출이 `normalized_value`에 canonical을 넣음. `normalized_value is None`(LLM이 변환 못 함) → **`UNCERTAIN`**(실제 불일치와 구분). "오토바이 라이딩 장갑"→용도:오토바이 → wanted 자전거와 NOMATCH, "라이딩" substring 오인 없음.
+- **NUMERIC**: `c.unit`과 `e.unit`이 둘 다 있어야 변환 후 비교. **`e.unit is None`이면 `UNCERTAIN`**(단위 없는 숫자를 target unit으로 가정하지 않음). 변환 후 `numeric_value`를 `wanted`(float)와 허용 오차로 비교.
+- **RANGE**: `c.range=(lo,hi)`. 제시가 단일(`numeric_value`)이면 `lo≤v≤hi`. 제시가 범위(`lower`/`upper`)면 **교집합** `not (upper<lo or lower>hi)`. 단위 없으면 `UNCERTAIN`.
+- **SUBSTRING**: 느슨한 포함. **soft 전용**. precision 게이트에서 사용분 별도 측정.
+- **FREETEXT**: `normalized_value` 있으면 ENUM처럼, 없으면 `UNCERTAIN`. **soft 전용.**
+
+제외 판정 `exclusion_hit(e, c)`도 **canonical+normalize**를 적용한다. `c.exclusions`의 각 값을 alias로 canonical화하고 normalize한 뒤 토큰 subsequence로 비교한다. 예: 제외 "합성섬유"의 alias "polyester" → "polyester 양말" 제외 성립.
 
 ### 4.3 MentionExtractor (글 → ProductMention[])
 
 - 저tier 생성형 LLM 포트. 본문·댓글 + SearchSpec(어떤 속성·canonical을 뽑을지 힌트)을 넣는다.
 - JSON schema 구조화 출력으로 `ProductMention[]`. FREETEXT/SYNONYM 속성은 canonical로 정규화해서 반환하도록 프롬프트.
 - 비교 글은 언급을 쪼개고 각 언급에 `role`을 부여하도록 프롬프트("실제 쓴 것"=USED, "비교"=COMPARED, "고려했다 뺌"=REJECTED_ALT).
-- **recall 우선**: 후보 언급은 일단 뽑는다.
-- 앞단 **CoarseGate**(순수 룰): 글에 카테고리/속성 키워드가 하나도 없으면 추출 호출 건너뛰고 빈 결과(비용 1차 방어).
-- **추출 누락 처리**: CoarseGate 통과했는데 빈 배열이면 1회 재시도. 그래도 비면 그 글을 `UNANALYZED`로 기록(silently drop 금지, 통계 노출). schema 검증 실패도 1회 재시도 후 `UNANALYZED`.
+- **recall 우선**: 후보 언급은 일단 뽑는다. 역할이 애매하면 `MENTIONED`(→채택 안 됨), 날조 금지.
+- 각 언급의 `raw`(근거 원문 조각)는 **필수**(role·속성의 근거). 비면 모델 검증 실패로 본다.
+- 앞단 **CoarseGate**(순수 룰): 글에 카테고리/속성 키워드가 하나도 없으면 추출 호출 건너뛰고 `EMPTY`(비용 1차 방어).
+- **EMPTY vs UNANALYZED 구분**(둘을 합치지 않는다):
+  - 정상 응답인데 언급이 없음 → `EMPTY`("관련 상품 언급 없음"). 재시도하지 않는다.
+  - 예외(timeout·rate limit·일시적 5xx·빈 content·schema 검증 실패) → 백오프로 재시도(횟수·간격 설정값), 끝내 실패하면 `UNANALYZED`("분석 못 함").
+  - 두 상태는 통계에서 따로 집계한다("후기 없음"과 "분석 실패"는 다른 의미).
 
 ### 4.4 MentionMatcher (언급 → 채택 여부, 결정적 룰)
 
@@ -212,12 +232,36 @@ RawPost
   → (1b ReportBuilder)
 ```
 
-`to_opinions(match: MentionMatch, post: RawPost) -> list[Opinion]`:
+`to_opinions(matches: list[MentionMatch], post: RawPost, normalizer) -> list[Opinion]`:
 - `MATCHED`인 언급의 `opinions`만 변환.
 - `Opinion.brand = mention.brand`(None이면 리포트에서 "브랜드 미상" 버킷).
-- `Opinion.quote = aspect_normalized MentionOpinion.quote`(120자 제한), `aspect = AspectNormalizer.canonical(...)`.
+- `aspect = AspectNormalizer.canonical(...)`, `quote` 120자 제한.
+- **인용 원문 검증**: LLM이 돌려준 `quote`가 실제 원문에 있는지 확인한다. `source_part=post`면 `normalize(제목+본문)`에 `normalize(quote)`가 포함돼야 하고, `source_part=comment`면 어느 댓글에 포함돼야 한다. 없으면(날조·변형) 그 의견을 버린다(통계에 dropped_quote로 집계).
 - `source_part`를 보존하고, 댓글 의견도 글 `url`을 출처로 유지.
 - 한 언급은 브랜드 1개이므로 다중 브랜드 혼입 없음(추출기가 보장).
+
+### 4.7 분석 오케스트레이션 (글 1건 파이프라인)
+
+매칭 엔진은 **글 1건을 받아 Opinion[]까지 조립하는 application service**를 제공한다. 전체 흐름(여러 글·리포트)은 1b가 조립한다.
+
+```python
+class PostAnalysis(BaseModel):
+    url: str
+    source: str
+    posted_at: datetime | None
+    likes: int
+    status: ExtractStatus      # OK | EMPTY | UNANALYZED
+    opinions: list[Opinion]
+    ad_rejected: bool = False  # (광고 판별은 1b/상위에서. 1a는 매칭까지)
+
+async def analyze_post(post, spec, extractor, normalizer) -> PostAnalysis:
+    #  CoarseGate → (통과시) extractor.extract → MentionMatcher.match_post
+    #  → to_opinions. status는 extract 결과를 따른다.
+```
+
+- CoarseGate 탈락 또는 extract `EMPTY` → `opinions=[]`, status 그대로.
+- `UNANALYZED` → `opinions=[]`, status=UNANALYZED(통계 노출).
+- 이 서비스가 "CategoryResolver 다음, ReportBuilder 앞"의 글 단위 조립 지점이다. 검색 전체(질의 해석 → 여러 글 → 리포트)는 1b의 `run_search`가 조립하고, 워커(3단계)가 이를 호출한다.
 
 ## 5. 데이터 흐름
 
@@ -230,13 +274,15 @@ RawPost ─(CoarseGate 룰)─ 키워드 전무 → 버림
          빈 추출/재시도 실패 → UNANALYZED(통계 노출)
 ```
 
-## 6. 포트와 어댑터
+## 6. 포트와 어댑터 (공식 계약)
 
-- `SpecParser`(고tier): `parse(query, known_schema?) -> ParseResult`
-- `MentionExtractor`(저tier): `extract(post, spec) -> ExtractResult{mentions, status}` (status: OK | EMPTY | UNANALYZED)
-- `SchemaCache`: `get/put/classify_category`
+- `SpecParser`(고tier): `async parse(query, known_schema?) -> ParseResult`
+- `MentionExtractor`(저tier): `async extract(post, spec) -> ExtractResult{mentions, status}`. status enum `ExtractStatus{OK, EMPTY, UNANALYZED}`. **반환 타입은 `ExtractResult`**(list 아님 — 상태를 실어야 EMPTY/UNANALYZED 구분).
+- `SchemaCache`: `get(category)/put(schema)/classify_category(query)`
+- 매처 계약은 삼상태 `match_attribute(e, c) -> AttrMatch`(§4.2). spec과 plan 모두 이 계약을 쓴다.
 - 어댑터: `OpenAiSpecParser`, `OpenAiMentionExtractor`(모델명 설정값), 테스트용 `FakeSpecParser`/`FakeMentionExtractor`.
-- 매처(`MentionMatcher`, MatchMode 구현)는 포트가 아니라 순수 도메인.
+- 매처·MentionMatcher·CoarseGate·to_opinions·analyze_post는 포트가 아니라 순수 도메인/application.
+- **재시도 어댑터 책임**: OpenAI 어댑터는 timeout·rate limit·일시적 5xx·빈 content·schema 검증 실패를 설정값(횟수·백오프)으로 재시도한다. spec parser도 동일. 정상 빈 응답은 재시도 대상 아님(EMPTY).
 
 ## 7. 테스트 전략
 
@@ -252,13 +298,14 @@ RawPost ─(CoarseGate 룰)─ 키워드 전무 → 버림
   - 숫자·범위 상품 (사이즈 240~260mm 등)
   - 한 글에서 여러 상품 비교 (role)
   - 동의어·별칭만으로 지칭 (라이딩 글러브, 메리노삭스)
+- **인용 검증 테스트**: 원문에 없는 quote는 버려지는지.
 - **평가 지표(함수로 명시)**: eval 모듈에 다음을 구현한다.
   - `mention_precision`, `mention_recall`
   - `excluded_mention_false_positive`(제외/비대상 언급을 채택한 수)
   - `target_mention_false_negative`(대상 USED 언급을 놓친 수)
-  - `by_category(...)` 카테고리별 집계
-  - `comparison_only(...)` 비교 글 전용 집계
-- **골든셋(룰 계층)**: 카테고리군 × 상황 분포 손 라벨 케이스. 룰 매처를 라벨에 대고 돌려 precision 측정. 100건+ 실제 라벨과 LLM precision/recall 게이트는 2단계.
+  - `role_accuracy`(라벨 role 대비 예측 role 일치율 — 추출 eval, 2단계 LLM 포함 시 본격화. 1단계는 골든셋에 `expected_role`을 두고 계산 함수만 검증)
+  - `by_category(...)`, `by_scenario(...)` 집계, `comparison_only(...)`
+- **골든셋 분포 자동 검증**: 각 케이스에 `category_group`과 `scenario`(정상·유사·제외·비교·애매·광고) 필드를 둔다. 테스트가 **scenario별 최소 개수**(각 ≥ 2)와 category_group ≥ 4를 검증한다. 룰 매처를 라벨에 돌려 precision 측정. 100건+ 실제 라벨과 LLM precision/recall·role 게이트는 2단계.
 
 ## 8. 확정된 결정 (구현 전 결정 완료)
 
@@ -267,7 +314,12 @@ RawPost ─(CoarseGate 룰)─ 키워드 전무 → 버림
 - **부정·비교 표현** → `ProductMention.role`로 처리. USED만 채택, 제외는 USED subject에만 적용.
 - **NUMERIC/RANGE 단위** → 길이(mm/cm/inch), 무게(g/kg)부터. 확장 가능.
 - **SUBSTRING** → soft 전용, hard 금지(validator).
-- **SYNONYM** → 방향 있는 alias→canonical, 추출 단계에서 canonical 산출.
+- **SYNONYM** → 방향 있는 alias→canonical, 추출 단계에서 canonical 산출. canonical 없으면 UNCERTAIN.
+- **NUMERIC/RANGE 단위 없음** → UNCERTAIN(단위 없는 숫자를 target unit으로 가정 안 함).
+- **인용 원문 없음** → 그 의견 버림(dropped_quote 집계).
+- **role 애매** → 추출기가 MENTIONED, 채택 안 함. role 근거는 `mention.raw`(필수).
+- **반환 계약** → extractor는 `ExtractResult`, 매처는 `AttrMatch` 삼상태. EMPTY≠UNANALYZED.
+- **오케스트레이션** → 1a는 `analyze_post`(글 1건), 1b `run_search`(검색 전체), 워커(3단계)가 run_search 호출.
 
 ## 9. 남은 열린 질문 (구현 중 조정 가능, 계약 불변)
 
