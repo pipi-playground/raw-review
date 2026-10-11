@@ -43,7 +43,8 @@
 | DB | PostgreSQL, SQLAlchemy 2.x, Alembic |
 | 수집 | httpx, Playwright(JS 렌더링이 필요한 페이지) |
 | HTML 파싱 | selectolax 또는 BeautifulSoup |
-| LLM | OpenAI API(구조화 출력, JSON schema). 포트/어댑터 구조로 교체 가능 |
+| LLM(생성형) | 2-tier. 질의 이해 = 고성능 모델, 대량 글 추출 = 저비용 모델. OpenAI API(JSON schema 구조화 출력), 포트/어댑터로 교체 가능. 모델명은 설정값 |
+| 결정 모델(향후) | Laya 같은 System-1 모델(상태+형식화 질문 → 확률, 생성 없음)을 광고 판별·언급 일치·aspect 분류 같은 제한된 결정에 도입 검토. **현재는 미도입**(생성형 LLM + 룰로 처리). 도입 시 보정·사람검토 임계값을 골든셋으로 검증 |
 | 웹 앱 | Next.js(App Router, TypeScript), PWA(설치형 웹 앱, 반응형) |
 | BFF | Next.js 서버(Route Handlers, Server Components) |
 | API 계약 | FastAPI OpenAPI 스키마 → openapi-typescript로 TS 타입 생성 |
@@ -78,27 +79,28 @@ raw-review/
 
 ### 4.1 catalog: 검색 의도와 카테고리
 
-- **Category**: 관리자가 등록하지 않는다. 검색 시점에 판별하고, 처음 등장한 카테고리는 DB에 캐시한다.
-- **AttributeSchema**: 카테고리별로 매칭에 쓰는 속성을 정의한다. 각 속성은 `hard`(반드시 일치)와 `soft`(가중치)로 나뉜다.
-  - 휴대폰케이스: 대상기기(hard), 형태(hard: 투명/범퍼/카드/가죽 등)
-  - 청소기: 형태(hard: 무선스틱/로봇/유선), 모델명(hard)
-  - 매트리스: 사이즈(soft), 경도(soft)
-  - 키보드: 배열(hard), 스위치(soft)
-- **SearchSpec**: 사용자 질의를 파싱한 결과. 예를 들어 "아이폰17 투명케이스"는 다음과 같이 파싱된다.
+이 context의 구조화 속성 모델과 언급 단위 매칭은 복잡도가 커서 **별도 하위프로젝트(매칭 엔진)로 분리**한다. 상세 설계는 `docs/superpowers/specs/2026-10-11-matching-engine-design.md`를 따른다. 아래는 요지다.
 
+- **Category**: 관리자가 등록하지 않는다. 검색 시점에 판별하고, 처음 등장한 카테고리는 DB에 캐시한다.
+- **AttributeSchema**: 카테고리 독립적인 구조화 속성 정의. 문자열 딕셔너리가 아니라 속성마다 매칭 규칙을 명시한다.
+  - 각 `AttributeDef`: `name`, `hard|soft`, `match_mode`(EXACT·ENUM·SYNONYM·NUMERIC·RANGE·SUBSTRING·FREETEXT), `canonical_values`, `aliases`, `exclusions`(속성 단위 제외값), `unit`(숫자/범위용), `normalization`(정규화 규칙).
+  - `category_aliases`로 카테고리명 별칭을 둔다. 예: 양말 = 삭스 = socks, 자전거용 장갑 = 라이딩 글러브.
+  - 예: 휴대폰케이스(대상기기=EXACT, 형태=ENUM), 울양말(소재=ENUM, 종류=ENUM), 부츠(종류=ENUM, 계절=ENUM), 운동화(사이즈=RANGE+unit mm).
+- **SearchSpec**: 사용자 질의를 파싱한 구조화 결과. 전역 `exclusion_variants`를 버리고 제외를 **속성 단위**로 둔다.
   ```
   category: 휴대폰케이스
-  hard_attributes: {대상기기: 아이폰17, 형태: 투명}
-  soft_attributes: {}
-  exclusion_variants: [17 Pro, 17 Pro Max, 17 Air, 16, 가죽]
-  aliases: {아이폰17: [아이폰 17, 아17, iphone17, iphone 17]}
+  constraints:
+    - {name: 대상기기, hard: true, match_mode: EXACT,
+       wanted: [아이폰17], aliases: {아이폰17: [iphone17, 아17]},
+       exclusions: [17 Pro, 17 Pro Max, 17 Air]}
+    - {name: 형태, hard: true, match_mode: ENUM,
+       wanted: [투명], aliases: {투명: [클리어]}, exclusions: [가죽]}
   ```
-
-- **CategoryResolver**(도메인 서비스, LLM 포트 사용): 질의를 받아 `SearchSpec`을 만든다.
-  - 해당 카테고리의 `AttributeSchema` 캐시가 있으면 재사용한다.
-  - 처음 보는 카테고리면 LLM이 스키마를 생성하고 캐시에 저장한다.
-  - 판별 신뢰도가 임계값 미만이면 선택지를 담은 `AmbiguousQuery`를 반환해 사용자에게 되묻는다. 예: "키보드" → 기계식/멤브레인/태블릿용
-- **Brand / ProductLine**: 카테고리 단위로 관리하는 별칭 사전. 예: 슈피겐 = spigen. 별칭은 LLM 추출 결과를 사전으로 정규화할 때 쓴다.
+- **CategoryResolver**(생성형 LLM 고tier 포트 사용): 질의 → 구조화 `SearchSpec`.
+  - 상품명 분해 규칙과 `category_aliases`로 "메리노삭스"→양말+소재:울, "라이딩 글러브"→자전거용 장갑처럼 연결한다.
+  - 해당 카테고리 `AttributeSchema` 캐시가 있으면 재사용한다. 없으면 LLM이 스키마를 생성해 캐시한다.
+  - 신뢰도가 임계값 미만이면 `AmbiguousQuery`로 되묻는다. 예: "키보드" → 기계식/멤브레인/태블릿용.
+- **Brand / ProductLine**: 카테고리 단위 별칭 사전. 예: 슈피겐 = spigen.
 
 ### 4.2 collection: 수집
 
@@ -124,27 +126,19 @@ raw-review/
 
 ### 4.3 analysis: 판별과 의견 추출
 
-글 하나마다 다음 파이프라인을 거친다.
+문서 전체를 문자열로 검사하지 않고 **상품 언급 단위**로 처리한다. 상세는 매칭 엔진 하위프로젝트 spec을 따른다. 요지:
 
-1. **RuleFilter**(순수 도메인, LLM 없음)
-   - 제목과 본문에 `exclusion_variants`만 나오고 대상 모델은 나오지 않으면 즉시 탈락시킨다.
-   - hard 속성의 핵심어와 별칭이 하나도 없으면 탈락시킨다.
-   - 광고 신호 점수를 매긴다: 협찬/제공/체험단/원고료 문구, 제휴·단축 링크, 쿠폰코드, 쇼핑 리뷰의 포인트 리뷰 문구, 복붙형 리뷰(동일 문장 반복).
-   - 결과는 `PASS` / `REJECT(reason)` / `UNCERTAIN` 중 하나다.
-2. **LlmJudge**(LLM 포트): `PASS`와 `UNCERTAIN`만 처리한다. 본문과 댓글 일부, SearchSpec을 넣고 JSON schema 출력을 받는다.
-   ```
-   relevance: {matches: bool, matched_attributes, reason}
-   ad: {is_ad: bool, confidence, evidence}
-   opinions: [{brand, product_line, polarity: con|pro, aspect, quote, source_part: post|comment}]
-   ```
-   - 댓글에 "광고네", "뒷광고" 같은 반응이 있으면 광고 근거로 쓴다.
-   - 댓글에서 나온 의견도 추출하되, 같은 모델/형태에 대한 의견일 때만 인정한다.
-3. **결과**: `RelevanceVerdict`, `AdVerdict`, `Opinion[]`
-   - `Opinion.quote`는 원문 표현 그대로 저장하되 최대 길이를 정해 자른다(예: 120자).
-   - 장점은 `aspect` 태그로만 집계하고 인용은 선택 사항이다.
-   - 단점은 인용이 필수다.
-- **LlmClassifier 포트**: 기본 어댑터는 `OpenAiClassifier`이고, 테스트에서는 `FakeClassifier`를 쓴다. 응답이 schema 검증에 실패하면 1회 재시도하고, 또 실패하면 그 글을 `UNANALYZED`로 표시한다.
-- **AspectNormalizer**: "누래짐", "황변", "변색"처럼 같은 뜻의 aspect를 카테고리 단위로 정규화한다. 처음에는 LLM 출력을 쓰고, 정규화 사전을 캐시해 점차 일관성을 높인다.
+1. **CoarseGate**(순수 룰, LLM 없음): 글에 카테고리/속성 키워드가 하나도 없으면 LLM 호출 없이 즉시 탈락시킨다. 비용 1차 방어.
+2. **MentionExtractor**(생성형 LLM 저tier 포트): 본문·댓글에서 `ProductMention[]`을 추출한다. 각 언급은 `{원문조각, 브랜드, 속성값(name→값), 그 언급에 붙은 의견(polarity·aspect·quote·source_part)}`.
+3. **MentionMatcher**(순수 룰, 결정적): 각 `ProductMention`을 `SearchSpec.constraints`와 `match_mode`로 비교한다.
+   - 하드 속성이 모두 일치하고, 속성 단위 `exclusions`에 걸리지 않는 언급만 대상으로 채택한다.
+   - **제외는 언급 단위다.** "면양말은 보풀, 울양말은 따뜻"에서 면양말 언급만 버리고 울양말 의견은 살린다. "17 Pro는 안 맞고 17 투명케이스는 변색"도 Pro 언급만 버린다.
+   - 퍼지 영역(FREETEXT·SYNONYM·애매 속성)은 현재 생성형 LLM 판정으로 처리한다. 향후 Laya 같은 결정 모델로 교체 검토.
+4. **광고 판별**: 룰 광고 신호 점수와 LLM 광고 판정을 OR로 합친다. 댓글의 "광고네/뒷광고"도 신호로 쓴다.
+5. **결과**: 채택된 언급의 의견만 `Opinion[]`으로 남긴다.
+   - `Opinion.quote`는 원문 표현 그대로 저장하되 최대 길이를 자른다(예: 120자). 단점은 인용 필수, 장점은 `aspect` 태그 집계.
+- **포트**: 생성형 LLM은 포트 뒤에 두고, 어댑터는 `OpenAi*`(고tier 질의이해 / 저tier 추출), 테스트는 fake. 응답이 schema 검증에 실패하면 1회 재시도 후 그 글을 `UNANALYZED`로 둔다.
+- **AspectNormalizer**: "누래짐/황변/변색"처럼 같은 뜻 aspect를 카테고리 단위로 정규화한다.
 
 ### 4.4 review: 리포트
 
@@ -242,13 +236,16 @@ raw-review/
 
 ## 10. 로드맵
 
-각 단계는 별도 구현 플랜으로 진행한다.
+각 단계는 별도 구현 플랜으로 진행한다. 1단계는 다시 하위프로젝트로 분해해 각자 spec을 가진다.
 
-1. **분석 코어**: catalog(SearchSpec, CategoryResolver), analysis(RuleFilter, LlmJudge, AspectNormalizer), review(ReportBuilder), OpenAI 어댑터, 골든셋 평가 하네스
-2. **수집**: Fetcher/RateLimiter/SourceHealth, CrawlJob 상태 관리, 소스 어댑터. 순서는 디시·클리앙·뽐뿌 → 퀘이사존·루리웹·FM코리아·쿨앤조이·아카라이브 → 네이버 쇼핑(정책 확인 후)
+1. **분석 코어**
+   1a. **매칭 엔진**(하위프로젝트, 자체 spec `2026-10-11-matching-engine-design.md`): 구조화 `AttributeSchema`/`SearchSpec`, match_mode 매처, `MentionExtractor`+`MentionMatcher`, CategoryResolver(2-tier LLM), AspectNormalizer, 카테고리별 골든셋. 가장 많은 테스트가 필요한 핵심.
+   1b. **리포트**: `ReportBuilder`(브랜드별 집계), 채택 언급 → `ProductReport`.
+2. **수집**: Fetcher/RateLimiter/SourceHealth, CrawlJob 상태 관리, 소스 어댑터. 순서는 디시·클리앙·뽐뿌 → 퀘이사존·루리웹·FM코리아·쿨앤조이·아카라이브 → 네이버 쇼핑(정책 확인 후). 실제 라벨로 골든셋 100건+ 확장, LLM precision/recall 게이트 가동.
 3. **워커 + 내부 검색 API + 캐시 + 관리자 API**, OpenAPI 타입 생성 파이프라인
 4. **Next.js 웹 앱 + BFF**: 인증 중계, 검색 화면, 리포트 화면, 관리자 화면
 5. **PWA**: 설치 지원(manifest, service worker), 모바일 반응형 다듬기, 웹 푸시 검토
+6. **(향후 최적화)** Laya 같은 결정 모델 도입: 광고 판별·언급 일치·aspect 분류를 System-1로. 보정·사람검토 임계값을 골든셋으로 검증 후 전환.
 
 ## 11. 열린 질문
 

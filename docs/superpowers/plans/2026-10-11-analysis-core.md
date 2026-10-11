@@ -1,5 +1,7 @@
 # 분석 코어 Implementation Plan
 
+> **⚠️ SUPERSEDED (2026-10-11):** 이 플랜의 catalog/analysis 설계(문자열 딕셔너리 SearchSpec, 문서 전체 문자열 RuleFilter)는 리뷰에서 상품 일반화·언급 단위 매칭을 표현하지 못하는 것으로 판명되어 폐기되었다. 구조화 속성 모델과 언급 단위 매칭은 `docs/superpowers/specs/2026-10-11-matching-engine-design.md`로 재설계되었다. **이 플랜대로 구현하지 말 것.** 매칭 엔진 spec 승인 후 새 플랜으로 대체한다.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 질의를 SearchSpec으로 해석하고, 수집된 글을 룰 + LLM으로 판별해 브랜드별 장단점 리포트를 만드는 순수 분석 코어를 만든다. 수집·API·DB 없이, 고정 입력과 FakeClassifier로 완결된다.
